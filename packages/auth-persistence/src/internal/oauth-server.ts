@@ -42,23 +42,22 @@ const migrations = [
 )`,
 ];
 
-const mysqlNamespaceLength = 512;
-const mysqlKeyLength = 64;
-
-/** Keys are binary-collated so that a token never matches a case variant of itself. */
+/** Keys are binary-collated so that a token never matches a case variant of itself.
+ * Ids and versions are 43-character random values; namespaces are at most 311 characters.
+ */
 const mysqlMigrations = [
   `CREATE TABLE yielded_oauth_server (
-  namespace VARCHAR(${mysqlNamespaceLength}) NOT NULL,
-  grant_id VARCHAR(${mysqlKeyLength}) NOT NULL,
-  version VARCHAR(${mysqlKeyLength}) NOT NULL,
+  namespace VARCHAR(512) NOT NULL,
+  grant_id VARCHAR(64) NOT NULL,
+  version VARCHAR(64) NOT NULL,
   revoked INTEGER NOT NULL DEFAULT 0,
   expires_at_millis BIGINT NOT NULL,
   payload LONGTEXT NOT NULL,
   PRIMARY KEY (namespace, grant_id)
 ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`,
   `CREATE TABLE yielded_oauth_client_assertion (
-  namespace VARCHAR(${mysqlNamespaceLength}) NOT NULL,
-  assertion_id VARCHAR(${mysqlKeyLength}) NOT NULL,
+  namespace VARCHAR(512) NOT NULL,
+  assertion_id VARCHAR(64) NOT NULL,
   expires_at_millis BIGINT NOT NULL,
   PRIMARY KEY (namespace, assertion_id)
 ) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`,
@@ -87,16 +86,6 @@ const layer = Layer.effect(
         ),
       );
 
-    /** Outside strict mode MySQL stores an overlong key cut, so refuse it first. */
-    const requireFit = (namespace: string, id: string) =>
-      sql.onDialectOrElse({
-        mysql: () =>
-          namespace.length > mysqlNamespaceLength || id.length > mysqlKeyLength
-            ? Effect.fail(Unavailable.make({}))
-            : Effect.void,
-        orElse: () => Effect.void,
-      });
-
     /** MySQL has neither ON CONFLICT nor RETURNING, so its primary key decides. */
     const claim = (insert: Statement.Fragment, conflict: Statement.Fragment) =>
       sql.onDialectOrElse({
@@ -119,8 +108,6 @@ const layer = Layer.effect(
       ) {
         yield* standalone;
         const receipt = yield* Schema.decodeEffect(AssertionReceipt)(input);
-
-        yield* requireFit(namespace, receipt.id);
 
         return yield* claim(
           sql`INSERT INTO yielded_oauth_client_assertion (namespace, assertion_id, expires_at_millis) VALUES (${namespace}, ${receipt.id}, ${receipt.expiresAtMillis})`,
@@ -146,8 +133,6 @@ const layer = Layer.effect(
         yield* standalone;
         const payload = yield* Schema.encodeEffect(codec)(record);
 
-        yield* requireFit(namespace, id);
-
         return yield* claim(
           sql`INSERT INTO yielded_oauth_server (namespace, grant_id, version, revoked, expires_at_millis, payload) VALUES (${namespace}, ${id}, ${record.version}, ${record.status === "Revoked" ? 1 : 0}, ${record.expiresAtMillis}, ${payload})`,
           sql`ON CONFLICT (namespace, grant_id) DO NOTHING RETURNING version`,
@@ -163,12 +148,10 @@ const layer = Layer.effect(
         if (version === record.version) return yield* Unavailable.make({});
         const payload = yield* Schema.encodeEffect(codec)(record);
 
-        const update = sql`UPDATE yielded_oauth_server SET version = ${record.version}, revoked = ${record.status === "Revoked" ? 1 : 0}, expires_at_millis = ${record.expiresAtMillis}, payload = ${payload} WHERE namespace = ${namespace} AND grant_id = ${id} AND version = ${version} AND revoked = 0`;
-
-        const changed = yield* sql.onDialectOrElse({
-          mysql: () => executeSqlChange(sql, update),
-          orElse: () => sql`${update} RETURNING version`.pipe(Effect.map((rows) => rows.length)),
-        });
+        const changed = yield* executeSqlChange(
+          sql,
+          sql`UPDATE yielded_oauth_server SET version = ${record.version}, revoked = ${record.status === "Revoked" ? 1 : 0}, expires_at_millis = ${record.expiresAtMillis}, payload = ${payload} WHERE namespace = ${namespace} AND grant_id = ${id} AND version = ${version} AND revoked = 0`,
+        );
 
         return changed === 1;
       }, failure),
