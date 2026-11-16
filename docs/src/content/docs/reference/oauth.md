@@ -30,13 +30,13 @@ Provide these to `oauth.layer`:
 | `resource`            | Exact protected resource URL on that origin                          |
 | `clients`             | Static registrations; may be empty with CIMD or `oauth.Clients`      |
 | `clientMetadata`      | Optional `{ allowedOrigins }` policy for metadata and JWKS discovery |
-| `registration`       | Optional scope policy that enables dynamic client registration       |
+| `registration`        | Optional scope policy that enables dynamic client registration       |
 | `loginPath`           | Login route that returns to `oauth.paths.authorize`                  |
 | `keys`                | Signing keyring; use separate random material from session keys      |
 | `oauth.Identity`      | Verify the current application session                               |
 | `oauth.Clients`       | Optional client registrations from your storage                      |
 | `oauth.Authorization` | Optional scope decision and claims at each token issue               |
-| `oauth.Registration` | Admission and storage for dynamic registration                       |
+| `oauth.Registration`  | Admission and storage for dynamic registration                       |
 
 Provide durable `OAuthServer.Persistence` plus `HttpClient`, `SecureRandom`, `Digest`, `Mac`, and
 `Signature`.
@@ -85,6 +85,10 @@ A document declares its exact URL as `client_id`, a `client_name`, and
 `redirect_uris`. It can declare public authentication or `private_key_jwt` with a
 public key source. Static registrations take precedence over stored ones, and both
 over metadata documents.
+
+When present, `grant_types` must include `authorization_code` and `response_types`
+must include `code`. Unknown capabilities are ignored; only an advertised
+`refresh_token` grant enables refresh for a metadata client.
 
 Use an HTTP client and network policy that reject private, loopback, and link-local
 destinations after DNS resolution. Disable redirects and ambient credentials.
@@ -259,7 +263,7 @@ PKCE, RS256 ID tokens, JWKS, and UserInfo for registered applications. Optional
 `scopes` is an array of branded `OAuthScope` values. The standard `openid`,
 `profile`, and `email` scopes are included automatically.
 
-Supply the server options above without `clientMetadata`; `resource` is optional.
+Supply the server options above without `clientMetadata` or `registration`; `resource` is optional.
 OpenID also requires:
 
 | Input              | Purpose                                                       |
