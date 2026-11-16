@@ -41,9 +41,12 @@ import {
   standardOpenIdScopes,
 } from "./authorization";
 import {
+  decodeRegistration,
+  makeClientRegistration,
   makeClients,
   makeClientStore,
   matchesRedirect,
+  maximumRegistrationBytes,
   MetadataConfiguration,
   type MetadataOptions,
 } from "./clients";
@@ -66,6 +69,8 @@ import {
   InvalidToken,
   Persistence,
   Random,
+  type Rejected,
+  RegistrationResponse,
   ResourceMetadata,
   ScopeText,
   Text,
@@ -231,20 +236,22 @@ const maximumFormBytes = 16384;
 // JWT access carries its scopes; leave room for a reserved assertion in the revocation form.
 const maximumJwtScopeLength = 4096;
 
-const form = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
-  if (
-    request.headers["content-type"]?.split(";")[0].trim().toLowerCase() !==
-    "application/x-www-form-urlencoded"
-  )
-    return yield* reject();
+const hasContentType = (request: HttpServerRequest.HttpServerRequest, type: string) =>
+  request.headers["content-type"]?.split(";")[0].trim().toLowerCase() === type;
+
+const boundedText = Effect.fnUntraced(function* (
+  request: HttpServerRequest.HttpServerRequest,
+  maximum: number,
+  tooLarge: Rejected,
+) {
   const decoder = new TextDecoder();
 
   const body = yield* request.stream.pipe(
     Stream.runFoldEffect(
       () => ({ text: "", bytes: 0 }),
       (body, chunk) =>
-        body.bytes + chunk.length > maximumFormBytes
-          ? Effect.fail(reject())
+        body.bytes + chunk.length > maximum
+          ? Effect.fail(tooLarge)
           : Effect.succeed({
               text: body.text + decoder.decode(chunk, { stream: true }),
               bytes: body.bytes + chunk.length,
@@ -259,7 +266,15 @@ const form = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerR
     ),
   );
 
-  return yield* parameters(new URLSearchParams(body.text + decoder.decode()));
+  return body.text + decoder.decode();
+});
+
+const form = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+  if (!hasContentType(request, "application/x-www-form-urlencoded")) return yield* reject();
+
+  return yield* parameters(
+    new URLSearchParams(yield* boundedText(request, maximumFormBytes, reject())),
+  );
 });
 
 export interface Options {
@@ -273,9 +288,20 @@ export interface Options {
   /** Login must return to paths.authorize. Pending authorization stays in a private cookie. */
   readonly loginPath: string;
   readonly keys: SessionSigningKeyring;
+  /** Enable anonymous RFC 7591 registration of public clients. Off when absent.
+   * Requires the server's Clients and Registration services. `defaultScopes` apply when
+   * a client names no scope, and clients may name only `allowedScopes`.
+   */
+  readonly registration?: {
+    readonly defaultScopes: ReadonlyArray<OAuthScope.OAuthScope>;
+    readonly allowedScopes: ReadonlyArray<OAuthScope.OAuthScope>;
+  };
 }
 
-export interface OpenIdOptions extends Omit<Options, "resource" | "clientMetadata"> {
+export interface OpenIdOptions extends Omit<
+  Options,
+  "resource" | "clientMetadata" | "registration"
+> {
   readonly identityKeys: IdentitySigningKeys;
   /** Explicit audience for application access. Defaults to this server's UserInfo endpoint. */
   readonly resource?: string;
@@ -339,6 +365,7 @@ const makeServer = <
   const AccessSchema = makeAccessSchema<Scope>(ScopeSchema);
   const AuthorizationResult = makeResultSchema(ScopeSchema);
   const Clients = makeClientStore(id);
+  const Registration = makeClientRegistration(id);
 
   const ScopedCurrentAccess = Context.Reference<Access<Scope> | undefined>(
     `effect-auth/OAuthServer/${id}/CurrentAccess/${JSON.stringify([...scopes].sort())}`,
@@ -354,6 +381,7 @@ const makeServer = <
     authorize: `/oauth/${id}/authorize`,
     token: `/oauth/${id}/token`,
     revoke: `/oauth/${id}/revoke`,
+    register: `/oauth/${id}/register`,
     metadata: "/.well-known/oauth-authorization-server",
     openIdMetadata: "/.well-known/openid-configuration",
     jwks: `/oauth/${id}/jwks`,
@@ -373,6 +401,8 @@ const makeServer = <
       readonly resourceMetadata: string;
       /** Exact name for this configured origin, including the HTTPS host prefix. */
       readonly cookieName: string;
+      /** Whether this server serves paths.register. */
+      readonly registrationEnabled: boolean;
     }
   >()(`effect-auth/OAuthServer/${id}`);
 
@@ -395,6 +425,9 @@ const makeServer = <
             resource: Url.check(Schema.isMaxLength(512)),
             clients: Schema.Array(Client),
             clientMetadata: Schema.optionalKey(MetadataConfiguration),
+            registration: Schema.optionalKey(
+              Schema.Struct({ defaultScopes: ScopesSchema, allowedScopes: ScopesSchema }),
+            ),
             loginPath: LoginPath,
             scopes: ScopesSchema,
             accessTokenFormat: Schema.Literals(["opaque", "jwt"]),
@@ -429,7 +462,10 @@ const makeServer = <
           // Clients may request every declared scope at once.
           !Schema.is(ScopeText)(config.scopes.join(" ")) ||
           (config.accessTokenFormat === "jwt" &&
-            config.scopes.join(" ").length > maximumJwtScopeLength)
+            config.scopes.join(" ").length > maximumJwtScopeLength) ||
+          config.registration?.defaultScopes.every((scope) =>
+            config.registration?.allowedScopes.includes(scope),
+          ) === false
         )
           return yield* ConfigurationError.make({});
 
@@ -442,6 +478,13 @@ const makeServer = <
         );
 
         const store = yield* Persistence;
+        const registration = yield* Effect.serviceOption(Registration);
+
+        if (
+          config.registration !== undefined &&
+          (Option.isNone(registration) || Option.isNone(yield* Effect.serviceOption(Clients)))
+        )
+          return yield* ConfigurationError.make({});
 
         const consentRenderer = Option.getOrElse(
           yield* Effect.serviceOption(ConsentRenderer),
@@ -476,6 +519,7 @@ const makeServer = <
         if (
           openId !== undefined &&
           (config.clientMetadata !== undefined ||
+            config.registration !== undefined ||
             !config.scopes.some((scope) => scope === "openid"))
         )
           return yield* ConfigurationError.make({});
@@ -574,6 +618,8 @@ const makeServer = <
           return (
             matchesRedirect(client, record.authorization.redirectUri) &&
             record.authorization.scopes.every(Schema.is(ScopeSchema)) &&
+            (client.scopes === undefined ||
+              record.authorization.scopes.every((scope) => client.scopes?.includes(scope))) &&
             (identity.openId === undefined ||
               (record.status !== "Code" && record.status !== "Active") ||
               (record.authentication !== undefined &&
@@ -828,9 +874,69 @@ const makeServer = <
                   code_challenge_methods_supported: ["S256"],
                   authorization_response_iss_parameter_supported: true,
                   client_id_metadata_document_supported: config.clientMetadata !== undefined,
+                  ...(config.registration === undefined
+                    ? {}
+                    : { registration_endpoint: `${config.origin}${paths.register}` }),
                   scopes_supported: config.scopes,
                 }),
               );
+            if (
+              config.registration !== undefined &&
+              Option.isSome(registration) &&
+              url.pathname === paths.register
+            ) {
+              if (web.method !== "POST")
+                return new Response(null, { status: 405, headers: { ...noStore, allow: "POST" } });
+
+              // Admission runs first so a refused caller costs no body read or parse.
+              if (
+                !(yield* registration.value.admit.pipe(
+                  Effect.provideService(
+                    HttpServerRequest.HttpServerRequest,
+                    // `request` comes from a web Request, which has no remote address.
+                    Option.getOrElse(
+                      yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest),
+                      () => request,
+                    ),
+                  ),
+                ))
+              )
+                return json({ error: "temporarily_unavailable" }, 429);
+              if (web.body === null || !hasContentType(request, "application/json"))
+                return yield* reject("invalid_client_metadata");
+
+              const metadata = yield* decodeRegistration(
+                yield* boundedText(
+                  request,
+                  maximumRegistrationBytes,
+                  reject("invalid_client_metadata"),
+                ),
+                config.registration,
+              );
+
+              const clientId = yield* random;
+
+              yield* registration.value.save(
+                yield* Schema.decodeUnknownEffect(Client)({ clientId, ...metadata }).pipe(
+                  Effect.mapError(() => reject("invalid_client_metadata")),
+                ),
+              );
+
+              return json(
+                RegistrationResponse.make({
+                  client_id: clientId,
+                  client_id_issued_at: Math.floor((yield* now) / 1000),
+                  client_name: metadata.name,
+                  redirect_uris: metadata.redirectUris,
+                  application_type: metadata.applicationType,
+                  grant_types: metadata.grantTypes,
+                  response_types: ["code"],
+                  token_endpoint_auth_method: "none",
+                  scope: metadata.scopes.join(" "),
+                }),
+                201,
+              );
+            }
             if (web.method === "GET" && url.pathname === resourceMetadataPath)
               return json(
                 ResourceMetadata.make({
@@ -864,11 +970,15 @@ const makeServer = <
                 const validation = yield* Effect.gen(function* () {
                   if (params.response_type !== undefined && params.response_type !== "code")
                     return yield* reject("unsupported_response_type");
-                  if (params.scope === undefined) return yield* reject("invalid_scope");
+                  // RFC 6749 section 3.3: an omitted scope means the client's registered scopes.
+                  const scope = params.scope ?? client.scopes?.join(" ");
 
-                  const query = yield* Schema.decodeUnknownEffect(AuthorizeQuery)(params).pipe(
-                    Effect.mapError(() => reject()),
-                  );
+                  if (scope === undefined) return yield* reject("invalid_scope");
+
+                  const query = yield* Schema.decodeUnknownEffect(AuthorizeQuery)({
+                    ...params,
+                    scope,
+                  }).pipe(Effect.mapError(() => reject()));
 
                   if (
                     (query.resource ?? (openId === undefined ? undefined : config.resource)) !==
@@ -899,6 +1009,12 @@ const makeServer = <
                   )
                     return yield* reject("unauthorized_client");
                   const requested = yield* scopeList(query.scope);
+
+                  if (
+                    client.scopes !== undefined &&
+                    !requested.every((scope) => client.scopes?.includes(scope))
+                  )
+                    return yield* reject("invalid_scope");
 
                   if (openId !== undefined && !requested.some((scope) => scope === "openid"))
                     return yield* reject("invalid_scope");
@@ -1242,8 +1358,9 @@ const makeServer = <
               const time = yield* now;
 
               const refreshEnabled =
-                openId === undefined ||
-                (config.refreshTokens && client.grantTypes?.includes("refresh_token") === true);
+                openId === undefined
+                  ? client.grantTypes === undefined || client.grantTypes.includes("refresh_token")
+                  : config.refreshTokens && client.grantTypes?.includes("refresh_token") === true;
 
               const next: Record = {
                 status: "Active",
@@ -1486,6 +1603,7 @@ const makeServer = <
           resource: config.resource,
           resourceMetadata,
           cookieName,
+          registrationEnabled: config.registration !== undefined,
         });
       }),
     );
@@ -1505,6 +1623,7 @@ const makeServer = <
       const route = (path: `/${string}`) => HttpRouter.add("*", path, handler);
 
       return Layer.mergeAll(
+        server.registrationEnabled ? route(paths.register) : Layer.empty,
         route(paths.authorize),
         route(paths.token),
         route(paths.revoke),
@@ -1703,6 +1822,7 @@ const makeServer = <
     Access: AccessSchema,
     CurrentAccess: ScopedCurrentAccess,
     Clients,
+    Registration,
   };
 };
 
@@ -1763,6 +1883,7 @@ export const make = <const Id extends string, const S extends ReadonlyArray<OAut
     Identity,
     Authorization: authorizationSource.Service,
     Clients: server.Clients,
+    Registration: server.Registration,
     layer: (options: Options) => server.layer(options),
   };
 };
@@ -1771,7 +1892,7 @@ export const make = <const Id extends string, const S extends ReadonlyArray<OAut
  * Standard OpenID scopes are included alongside application scopes.
  * Applications own authentication, current session validity and profile disclosure.
  * Resource JWTs and rotating refresh tokens are opt-in. Clients are static or come
- * from the Clients service; registration endpoints and front/back-channel logout
+ * from the Clients service; dynamic registration and front/back-channel logout
  * are not provided.
  */
 export const makeOpenId = <
@@ -1795,7 +1916,11 @@ export const makeOpenId = <
 
   const authorizationSource = makeOpenIdAuthorization<Id, OpenIdScope>(id);
 
-  const server = makeServer(
+  const {
+    Registration: _,
+    paths: { register: __, ...paths },
+    ...server
+  } = makeServer(
     id,
     { scopes },
     Effect.gen(function* () {
@@ -1826,6 +1951,7 @@ export const makeOpenId = <
 
   return {
     ...server,
+    paths,
     Identity,
     Authorization: authorizationSource.Service,
     layer: (options: OpenIdOptions) =>
@@ -1833,7 +1959,7 @@ export const makeOpenId = <
         ? Layer.effect(server.Service, Effect.fail(ConfigurationError.make({})))
         : server.layer({
             ...options,
-            resource: options.resource ?? `${options.origin}${server.paths.userInfo}`,
+            resource: options.resource ?? `${options.origin}${paths.userInfo}`,
           }),
   };
 };
